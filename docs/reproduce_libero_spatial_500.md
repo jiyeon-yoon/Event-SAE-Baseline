@@ -1,5 +1,9 @@
 # LIBERO-Spatial 500 재현
 
+이 문서는 **기존 500 rollouts와 학습된 Layer 31 SAE를 내려받아 Baseline을
+검증하는 경로**다. 처음 실행하는 팀원은 이 경로부터 사용한다. Activation 수집과
+SAE 학습부터 다시 수행하려면 [OpenVLA 가이드](openvla.md)의 Phase 1을 따른다.
+
 이미 수집·학습한 아래 산출물을 재사용한다.
 
 - 10 tasks × 50 rollouts = 500 episodes
@@ -25,34 +29,48 @@ intervention은 새로운 closed-loop rollout을 생성하므로 아래 discover
 
 ## RunPod
 
+- Container image:
+  `ghcr.io/jiyeon-yoon/event-sae-runtime@sha256:ef895731ffd73985e1183c964b479bdcc7e97dfeabea6c8777b903c54ade1405`
 - RTX 4090 한 장으로 실행 가능
 - Container disk: 400 GB
-- Volume disk: 0 GB 가능. 단 Pod terminate 전에 결과를 외부에 업로드한다.
-- 기존 GHCR image에는 이 재현 코드가 없으므로, GitHub에 push한 재현 코드의
-  **정확한 commit**을 별도로 받는다.
+- Volume disk: 0 GB 가능. 단 Pod stop·restart·terminate 전에 결과를 외부에
+  업로드한다. `/workspace` 보존을 전제로 하지 않는다.
+- GHCR image는 의존성 환경을 제공한다. Baseline 코드는 아래에서 별도로 clone하고
+  검증된 commit으로 고정한다.
+
+Pod가 시작되면 Web terminal을 열고 환경만 확인한다.
 
 ```bash
 event-sae-init
 event-sae-verify --require-gpu
+```
 
+장시간 작업은 tmux 안에서 실행한다.
+
+```bash
 tmux new -s event-sae-spatial
+```
 
-EVENT_SAE_COMMIT=GITHUB에_PUSH한_40자리_COMMIT
-test "${#EVENT_SAE_COMMIT}" -eq 40 || { echo "COMMIT_REQUIRED"; exit 1; }
+이제 열린 tmux 화면 안에 아래 블록을 붙여 넣는다.
+
+```bash
+set -euo pipefail
+
+export EVENT_SAE_COMMIT=fd3bc485668b8fb32b3948a9b642859f41b16277
 
 cd /workspace
-test -d Event-SAE-Pipeline/.git || \
-  git clone https://github.com/jiyeon-yoon/Event-SAE-Pipeline.git Event-SAE-Pipeline
-test -z "$(git -C Event-SAE-Pipeline status --porcelain)" || \
+test -d Event-SAE-Baseline/.git || \
+  git clone https://github.com/jiyeon-yoon/Event-SAE-Baseline.git Event-SAE-Baseline
+test -z "$(git -C Event-SAE-Baseline status --porcelain)" || \
   { echo "DIRTY_SOURCE"; exit 1; }
-git -C Event-SAE-Pipeline fetch origin main
-git -C Event-SAE-Pipeline checkout --detach "$EVENT_SAE_COMMIT"
-test "$(git -C Event-SAE-Pipeline rev-parse HEAD)" = "$EVENT_SAE_COMMIT" || exit 1
+git -C Event-SAE-Baseline fetch origin main
+git -C Event-SAE-Baseline checkout --detach "$EVENT_SAE_COMMIT"
+test "$(git -C Event-SAE-Baseline rev-parse HEAD)" = "$EVENT_SAE_COMMIT" || exit 1
 
-cd /workspace/Event-SAE-Pipeline
+cd /workspace/Event-SAE-Baseline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 git rev-parse HEAD
-PYTHONPATH=. pytest -q
+python -m pytest -q
 ```
 
 테스트가 실패하면 GPU 작업을 시작하지 않는다. tmux 재접속 명령은
@@ -60,10 +78,13 @@ PYTHONPATH=. pytest -q
 
 ## 1. 입력 다운로드·검증
 
-공개 Hugging Face 저장소이므로 다운로드에는 token이 필요 없다.
+입력 저장소는 공개지만 281 GB를 비로그인 상태로 받으면 rate limit이 발생할 수
+있다. **Read token으로 로그인**한 뒤 다운로드한다.
 
 ```bash
-cd /workspace/Event-SAE-Pipeline
+hf auth whoami || hf auth login
+
+cd /workspace/Event-SAE-Baseline
 python scripts/openvla/download_libero_spatial_reproduction_inputs.py \
   --output-root /workspace/event-sae-spatial-inputs
 ```
@@ -79,7 +100,9 @@ activation_shards: 369
 ## 2. Discovery pipeline 실행
 
 ```bash
-cd /workspace/Event-SAE-Pipeline
+set -euo pipefail
+export EVENT_SAE_COMMIT=fd3bc485668b8fb32b3948a9b642859f41b16277
+cd /workspace/Event-SAE-Baseline
 python scripts/openvla/reproduce_libero_spatial_500.py \
   --input-root /workspace/event-sae-spatial-inputs \
   --work-dir /workspace/event-sae-spatial-repro \
@@ -118,11 +141,14 @@ DISCOVERY_PIPELINE_OK: /workspace/event-sae-spatial-repro/pipeline_summary.json
 
 ## 3. Discovery 결과 업로드
 
-Volume disk가 0 GB이므로 아래 원격 검증이 끝나기 전 Pod를 terminate하지 않는다.
+Volume disk가 0 GB이면 아래 원격 검증 전 Pod를 stop·restart·terminate하지 않는다.
+팀원은 자신의 Hugging Face namespace에 결과 저장소를 만든다.
 
 ```bash
+set -euo pipefail
 hf auth whoami || hf auth login
-HF_RESULTS_REPO=jiyeony/event-sae-libero-spatial-reproduction
+HF_USER=$(python -c "from huggingface_hub import HfApi; print(HfApi().whoami()['name'])")
+export HF_RESULTS_REPO="$HF_USER/event-sae-libero-spatial-reproduction"
 
 python scripts/openvla/upload_reproduction_results.py \
   --work-dir /workspace/event-sae-spatial-repro \
@@ -141,7 +167,9 @@ cluster·ranking 결과만 올린다.
 재사용하는 방법은 빠른 탐색용일 뿐 정확한 비교로 취급하지 않는다.
 
 ```bash
-cd /workspace/Event-SAE-Pipeline
+set -euo pipefail
+export EVENT_SAE_COMMIT=fd3bc485668b8fb32b3948a9b642859f41b16277
+cd /workspace/Event-SAE-Baseline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p /workspace/event-sae-spatial-repro/hooked-sr/runs
 
@@ -169,6 +197,10 @@ python scripts/openvla/compare_hooked_sr.py \
   --expected-code-revision "$EVENT_SAE_COMMIT" \
   --output-path /workspace/event-sae-spatial-repro/hooked-sr/comparison.json
 
+test -n "${HF_RESULTS_REPO:-}" || {
+  HF_USER=$(python -c "from huggingface_hub import HfApi; print(HfApi().whoami()['name'])")
+  export HF_RESULTS_REPO="$HF_USER/event-sae-libero-spatial-reproduction"
+}
 python scripts/openvla/upload_reproduction_results.py \
   --work-dir /workspace/event-sae-spatial-repro \
   --repo-id "$HF_RESULTS_REPO" \
@@ -194,7 +226,9 @@ python scripts/openvla/upload_reproduction_results.py \
 실측 속도 기준 약 2~4시간을 예상한다.
 
 ```bash
-cd /workspace/Event-SAE-Pipeline
+set -euo pipefail
+export EVENT_SAE_COMMIT=fd3bc485668b8fb32b3948a9b642859f41b16277
+cd /workspace/Event-SAE-Baseline
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 python scripts/openvla/run_intervention_development_validation.py \
@@ -222,6 +256,10 @@ INTERVENTION_DEVELOPMENT_VALIDATION_OK
 `action_change_observed`는 실제 행동 변화 관측값이며 구현 통과 조건과 분리된다.
 
 ```bash
+test -n "${HF_RESULTS_REPO:-}" || {
+  HF_USER=$(python -c "from huggingface_hub import HfApi; print(HfApi().whoami()['name'])")
+  export HF_RESULTS_REPO="$HF_USER/event-sae-libero-spatial-reproduction"
+}
 python scripts/openvla/upload_reproduction_results.py \
   --work-dir /workspace/event-sae-spatial-repro \
   --repo-id "$HF_RESULTS_REPO" \
@@ -232,6 +270,9 @@ python scripts/openvla/upload_reproduction_results.py \
 
 ## 6. 논문 규모의 전체 Intervention
 
+이 단계는 Baseline 코드 실행에 필수인 smoke test가 아니라, 논문 규모의 통계적
+intervention 결과가 필요할 때만 실행한다.
+
 `candidates.jsonl`은 ranking 4종 × 5개로 20행이지만 feature ID가 서로 겹칠 수
 있다. 동일 feature는 한 번만 실행하고 결과를 ranking 간 공유해야 한다.
 
@@ -241,6 +282,10 @@ intervention을 순서대로 실행한다. 완료된 결과는 재실행하지 �
 이어서 실행할 수 있다.
 
 ```bash
+set -euo pipefail
+export EVENT_SAE_COMMIT=fd3bc485668b8fb32b3948a9b642859f41b16277
+cd /workspace/Event-SAE-Baseline
+
 python scripts/openvla/run_intervention_sweep.py \
   --config configs/reproduction/openvla/libero_spatial_intervention_layer31.yaml \
   --candidates /workspace/event-sae-spatial-repro/pipeline/rankings/candidates.jsonl \
@@ -248,6 +293,10 @@ python scripts/openvla/run_intervention_sweep.py \
   --work-dir /workspace/event-sae-spatial-repro \
   --expected-code-revision "$EVENT_SAE_COMMIT"
 
+test -n "${HF_RESULTS_REPO:-}" || {
+  HF_USER=$(python -c "from huggingface_hub import HfApi; print(HfApi().whoami()['name'])")
+  export HF_RESULTS_REPO="$HF_USER/event-sae-libero-spatial-reproduction"
+}
 python scripts/openvla/upload_reproduction_results.py \
   --work-dir /workspace/event-sae-spatial-repro \
   --repo-id "$HF_RESULTS_REPO" \

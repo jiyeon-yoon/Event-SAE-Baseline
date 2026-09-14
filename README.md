@@ -1,80 +1,98 @@
-# Event-SAE
+# Event-SAE Baseline
 
-Codebase for "Event-Grounded Sparse Autoencoders for
-Vision-Language-Action Policies". The project scales sparse-autoencoder
-feature labeling by anchoring candidate features in SAE-independent
-kinematic events from closed-loop rollouts, ranking them against
-VLM-labeled event clusters, and validating each ranking with
-residual-preserving zero-out interventions.
+[xc-j/Event-SAE](https://github.com/xc-j/Event-SAE)의 공개 코드를 기반으로
+OpenVLA + LIBERO-Spatial 실험을 재현하고 검증할 수 있게 정리한 baseline이다.
 
-**Paper:** https://arxiv.org/abs/2605.17204
+- 원본 논문: [Event-Grounded Sparse Autoencoders for Vision-Language-Action Policies](https://arxiv.org/abs/2605.17204)
+- 고정 코드: `fd3bc485668b8fb32b3948a9b642859f41b16277`
+- 범위: LIBERO-Spatial 10 tasks × 50 rollouts, OpenVLA Layer 31
 
-Two VLA backbones are covered: **openVLA** and **openpi (π₀.₅)**, on
-the LIBERO simulation suites.
+## 무엇이 추가됐나
 
-## Pipeline
+원본의 activation 수집, BatchTopK SAE 학습, AWE, event clustering, feature
+ranking, intervention 코어는 유지했다. 그 위에 다음 재현·검증 계층을 추가했다.
 
-Four stages plus a ranking bridge, 11 numbered steps in total:
+- 논문 설정과 OpenVLA model/code revision 고정
+- 5개 GPU에서 분할 수집한 500 rollouts의 검증·무손실 병합
+- 전체 activation의 FVE, alive fraction, L0와 보조 MSE 평가
+- AWE → clustering → feature ranking 일괄 실행 및 결과 검증
+- Raw policy와 SAE reconstruction policy의 closed-loop 성공률 비교
+- 동일 initial state 기반 intervention 구현 검증과 전체 sweep 실행기
 
-| Stage | Steps | Produces |
-|---|---|---|
-| 1. SAE training | a, b | activation shards → trained SAE |
-| 2. Kinematic keyframes | c | AWE waypoints per episode |
-| 3. Event clustering + VLM annotation | d–g | labeled event clusters |
-| Feature ranking (bridge) | h, i, j | top-K candidate features per ranking |
-| 4. Closed-loop intervention | k | per-feature ΔSR |
+## 데이터 수집
 
-Stages 1–4 are shared across backbones; activation collection (a) and
-the intervention hook (k) are backbone-specific. Per-backbone guides:
+수집 코어는 원본 Event-SAE의 `scripts/openvla/collect_activations.py`를 사용했다.
 
-- **openVLA** — [docs/openvla.md](docs/openvla.md)
-- **현재 Spatial-500 재현** — [docs/reproduce_libero_spatial_500.md](docs/reproduce_libero_spatial_500.md)
-- **openpi (π₀.₅)** — [docs/openpi.md](docs/openpi.md)
-
-Each guide includes installation, the full pipeline (steps a–k),
-pretrained SAE checkpoints from the paper (on the Hugging Face Hub),
-and a reproducibility check against the original research artifacts.
-
-## Repository layout
-
-Step letters in parentheses map to the `a`–`k` pipeline table above.
-
+```text
+LIBERO-Spatial 10 tasks × task당 50 rollouts = 500 rollouts
+→ RGB + task instruction으로 OpenVLA가 7D action 예측
+→ LIBERO가 action 실행
+→ 매 policy forward의 Layer 31 post-MLP residual 저장
 ```
-event_sae/                     core library
-  sae.py                       BatchTopK SAE
-  train.py                     SAE training (b)
-  keyframes/extract.py         AWE kinematic keyframes (c)
-  events/                      event clustering + VLM annotation (d–g)
-    extract_media.py           5-frame bundles (d)
-    build_features.py          vision + state embeddings (e)
-    cluster.py                 task-local clustering (f)
-    annotate.py, prompts.py    Gemini cluster annotation (g)
-  scoring/                     feature scoring + ranking (h–j)
-    score_matrix.py            event-feature score matrix (i)
-    rankings.py                four ranking strategies (j)
-  evaluate.py                  offline SAE fidelity (FVE, MSE, alive, L0)
-  openvla/                     openVLA backbone: collection (a) + intervention (k)
-  openpi/                      openpi backbone: collection (a) + intervention (k)
-scripts/                       CLI entry points, one per step
-  train_sae.py                          (b)
-  evaluate_sae.py                       offline SAE fidelity
-  extract_keyframes.py                  (c)
-  extract_keyframe_media.py             (d)
-  build_event_features.py               (e)
-  cluster_events.py                     (f)
-  annotate_clusters.py                  (g)
-  extract_topk.py                       (h)
-  score_cluster_features.py             (i)
-  build_feature_rankings.py             (j)
-  openvla/{collect_activations,intervene}.py   (a, k — openVLA)
-  openpi/{serve_policy,eval_libero}.py         (a, k — openpi)
-configs/examples/{openvla,openpi}/   example YAML configs
-docs/{openvla,openpi}.md             per-backbone runbooks
-environment-openvla.yml              conda env (openVLA)
-environment-{openvla,openpi}.lock.yml  pinned snapshots
+
+실제 수집은 RTX 4090 Pod 5개에서 task를 `0–1`, `2–3`, `4–5`, `6–7`,
+`8–9`로 나눠 진행했다. 각 부분은 Hugging Face에 올린 뒤 global episode ID와
+activation index를 함께 다시 매핑해 병합한다.
+
+저장 항목은 dense activation, activation index, 7D action, EEF pose, gripper,
+task 정보, 성공 로그, rollout MP4다. Object pose, contact/grasp, reward, subgoal
+predicate를 추가로 기록하는 확장 수집기는 이 baseline 범위에 포함하지 않는다.
+
+## 처음 실행할 때
+
+두 경로를 혼동하지 않는다.
+
+1. **기존 500 rollouts와 학습된 SAE로 재현** — 처음 확인할 때 권장
+   [LIBERO-Spatial 500 재현 Runbook](docs/reproduce_libero_spatial_500.md)을 순서대로 실행한다.
+2. **activation 수집과 SAE 학습부터 다시 수행** — 비용과 시간이 더 필요
+   [OpenVLA 가이드](docs/openvla.md)의 Phase 1부터 실행한다. 수집은 RTX 4090으로
+   가능하지만, 논문 설정의 SAE 학습은 24 GB VRAM에서 OOM이 확인되어 H100 80 GB
+   환경에서 검증했다.
+
+기존 데이터 재현에 사용하는 RunPod 설정:
+
+| 항목 | 값 |
+|---|---|
+| Container image | `ghcr.io/jiyeon-yoon/event-sae-runtime@sha256:ef895731ffd73985e1183c964b479bdcc7e97dfeabea6c8777b903c54ade1405` |
+| GPU | RTX 4090 1장 이상 |
+| Container disk | 400 GB |
+| Volume disk | 0 GB 가능. 종료 전 결과를 외부에 업로드 |
+
+최소 시작 명령:
+
+```bash
+event-sae-init
+event-sae-verify --require-gpu
+
+cd /workspace
+git clone https://github.com/jiyeon-yoon/Event-SAE-Baseline.git
+cd Event-SAE-Baseline
+git checkout --detach fd3bc485668b8fb32b3948a9b642859f41b16277
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest -q
+```
+
+이후 입력 다운로드부터는 [재현 Runbook](docs/reproduce_libero_spatial_500.md)을 따른다.
+
+## 검증 상태
+
+- Spatial-500 discovery pipeline: 완료
+- Raw vs SAE reconstruction Hooked SR: 완료
+- Intervention 개발 검증: 완료
+- 논문 규모 전체 intervention sweep: 실행 코드 제공, 전체 실험은 선택 사항
+
+파생 결과는 [Hugging Face](https://huggingface.co/datasets/jiyeony/event-sae-libero-spatial-reproduction)에서 확인할 수 있다.
+
+## 주요 파일
+
+```text
+event_sae/                         Event-SAE 코어와 평가 코드
+scripts/openvla/                  수집·재현·Hooked SR·intervention CLI
+configs/reproduction/openvla/     고정 재현 설정
+docs/reproduce_libero_spatial_500.md
+tests/                             병합·평가·hook·intervention 검증
 ```
 
 ## License
 
-MIT (see `LICENSE`). External libraries cloned under `external/` at
-install time retain their own licenses.
+MIT. 원본 및 외부 의존성의 라이선스는 각 저장소를 따른다.
